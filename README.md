@@ -23,3 +23,9 @@ SILENT + REPORT ONLY
 python nuclei.py -u target.com --silent -o out.jsonl
 
 🔰 cara pakai (termux) :
+pkg update && pkg upgrade -y
+pkg install python -y
+pkg install clang -y   
+pkg install libxml2 libxslt -y
+pkg install openssl -y
+pkg install ca-certificates -y
