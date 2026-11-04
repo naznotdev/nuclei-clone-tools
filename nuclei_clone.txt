@@ -1,0 +1,1039 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Nuclei Clone for Termux / Android - Deep & Complete Edition
+Single-file Python implementation with 230+ real YAML templates.
+Author  : Nazreal (adapted)
+Version : 1.10
+
+Usage:
+  python nuclei.py -u https://example.com
+  python nuclei.py -u example.com -severity critical,high -stats
+  python nuclei.py -l targets.txt -c 30 -rl 100 -o out.jsonl -md report.md -html report.html
+"""
+
+import os
+import re
+import sys
+import time
+import json
+import random
+import string
+import hashlib
+import argparse
+import threading
+import concurrent.futures
+from urllib.parse import urlparse, urljoin, quote
+from datetime import datetime
+
+# ---------- deps ----------
+try:
+    import yaml
+except ImportError:
+    print("[!] pip install pyyaml"); sys.exit(1)
+
+try:
+    import requests
+    from requests.packages.urllib3.exceptions import InsecureRequestWarning
+    requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+except ImportError:
+    print("[!] pip install requests"); sys.exit(1)
+
+try:
+    from colorama import init, Fore, Style
+    init(autoreset=True)
+except ImportError:
+    class Fore:
+        RED = GREEN = YELLOW = BLUE = MAGENTA = CYAN = WHITE = RESET = ""
+    class Style:
+        BRIGHT = DIM = NORMAL = RESET_ALL = ""
+
+# ============================================================
+# BANNER
+# ============================================================
+BANNER = r"""
+  _   _ _   _  ____ _     _____ ___ 
+ | \ | | | | |/ ___| |   | ____|_ _|
+ |  \| | | | | |   | |   |  _|  | | 
+ | |\  | |_| | |___| |___| |___ | | 
+ |_| \_|\___/ \____|_____|_____|___|
+          
+          [ + ]  C O D E   B Y  N A Z R E A L  [ + ]
+"""
+
+# ============================================================
+# SEVERITY
+# ============================================================
+SEV_ORDER = {"critical": 5, "high": 4, "medium": 3, "low": 2, "info": 1, "unknown": 0}
+SEV_COLOR = {
+    "critical": Fore.MAGENTA + Style.BRIGHT,
+    "high":     Fore.RED     + Style.BRIGHT,
+    "medium":   Fore.YELLOW  + Style.BRIGHT,
+    "low":      Fore.BLUE    + Style.BRIGHT,
+    "info":     Fore.CYAN,
+    "unknown":  Fore.WHITE,
+}
+SEV_BADGE = {
+    "critical": "[ CRITICAL ]",
+    "high":     "[   HIGH   ]",
+    "medium":   "[  MEDIUM  ]",
+    "low":      "[   LOW    ]",
+    "info":     "[   INFO   ]",
+    "unknown":  "[ UNKNOWN  ]",
+}
+
+# ============================================================
+# MATCHER HELPERS
+# ============================================================
+def W(*words):
+    """Word matcher (body)."""
+    return {"type": "word", "part": "body", "words": list(words)}
+
+def WH(*words):
+    """Word matcher (header)."""
+    return {"type": "word", "part": "header", "words": list(words)}
+
+def R(pattern):
+    """Regex matcher (body)."""
+    return {"type": "regex", "part": "body", "regex": [pattern]}
+
+def S(*statuses):
+    """Status matcher."""
+    return {"type": "status", "status": list(statuses)}
+
+# ============================================================
+# TEMPLATE DATABASE (~230 real checks)
+# ============================================================
+SENSITIVE_CHECKS = [
+    # ---------- VCS ----------
+    ("/.git/config", "high",     "Git Config Exposure",         "Git repo config file exposed",           [W("[core]")]),
+    ("/.git/HEAD",   "high",     "Git HEAD Exposure",           "Git HEAD ref exposed",                   [W("ref:")]),
+    ("/.git/COMMIT_EDITMSG", "medium", "Git Commit Message Leak", "Last commit message leaked",             [S(200)]),
+    ("/.git/index", "medium",    "Git Index File",              "Git index file exposed",                 [S(200)]),
+    ("/.svn/entries", "medium",  "SVN Entries Exposure",        "Subversion entries file",                [S(200)]),
+    ("/.svn/wc.db",  "medium",   "SVN WC Database",             "Subversion working-copy database",       [S(200)]),
+    ("/.hg/requires", "medium",  "Mercurial Requires",          "Mercurial requires file",                [S(200)]),
+    ("/.bzr/README", "low",      "Bazaar README",               "Bazaar README file",                     [S(200)]),
+
+    # ---------- ENV / CONFIG ----------
+    ("/.env",              "critical", "Env File Exposure",       "Environment file with secrets",       [R(r"(DB_|APP_KEY|SECRET|PASSWORD)")]),
+    ("/.env.local",        "critical", "Env Local File",          "Local env file",                      [R(r"(DB_|SECRET|KEY)")]),
+    ("/.env.production",   "critical", "Env Production File",     "Production env file",                 [R(r"(DB_|SECRET|KEY)")]),
+    ("/.env.development",  "critical", "Env Development File",    "Development env file",                [R(r"(DB_|SECRET|KEY)")]),
+    ("/.env.bak",          "critical", "Env Backup",              ".env backup",                         [R(r"(DB_|SECRET|KEY)")]),
+    ("/.env.old",          "critical", "Env Old",                 ".env old file",                       [R(r"(DB_|SECRET|KEY)")]),
+    ("/.env.save",         "critical", "Env Save",                ".env save file",                      [R(r"(DB_|SECRET|KEY)")]),
+    ("/.env.swp",          "high",     "Env Vim Swap",            ".env vim swap file",                  [S(200)]),
+    ("/config.php",         "high",   "PHP Config",               "PHP config exposed",                  [S(200)]),
+    ("/config.php.bak",     "critical","PHP Config Backup",       "PHP config backup",                   [S(200)]),
+    ("/config.php.old",     "critical","PHP Config Old",          "PHP config .old",                     [S(200)]),
+    ("/config.php.save",    "critical","PHP Config Save",         "PHP config .save",                    [S(200)]),
+    ("/config.php~",        "high",   "PHP Config Tilde",         "PHP config vim tilde",                [S(200)]),
+    ("/configuration.php.bak","critical","Joomla Config Backup",  "Joomla config backup",                [S(200)]),
+    ("/wp-config.php.bak",  "critical","WP Config Backup",        "WordPress wp-config backup",          [S(200)]),
+    ("/web.config",         "high",   "IIS Web.config",           "IIS web.config exposed",              [W("<configuration>")]),
+    ("/.htaccess",          "medium", ".htaccess Exposure",      "Apache .htaccess exposed",            [S(200)]),
+    ("/.htpasswd",          "high",   ".htpasswd Exposure",      "Apache htpasswd exposed",             [R(r":\$apr1\$|:\{SHA\}")]),
+
+    # ---------- SHELL ----------
+    ("/.bash_history",     "high",   "Bash History",             "Bash command history leaked",         [S(200)]),
+    ("/.zsh_history",      "high",   "Zsh History",              "Zsh command history leaked",          [S(200)]),
+    ("/.bashrc",           "low",    "Bashrc Exposure",          ".bashrc exposed",                     [S(200)]),
+    ("/.profile",          "low",    "Profile Exposure",         ".profile exposed",                    [S(200)]),
+    ("/.ssh/authorized_keys","high", "SSH Authorized Keys",      "Authorized SSH keys exposed",         [W("ssh-")]),
+
+    # ---------- SSH KEYS ----------
+    ("/.ssh/id_rsa",       "critical","SSH RSA Private Key",      "RSA private key exposed",             [W("PRIVATE KEY")]),
+    ("/.ssh/id_dsa",       "critical","SSH DSA Private Key",      "DSA private key exposed",             [W("PRIVATE KEY")]),
+    ("/.ssh/id_ecdsa",     "critical","SSH ECDSA Private Key",    "ECDSA private key exposed",           [W("PRIVATE KEY")]),
+    ("/.ssh/id_ed25519",   "critical","SSH Ed25519 Private Key",  "Ed25519 private key exposed",         [W("PRIVATE KEY")]),
+    ("/.ssh/known_hosts",  "medium", "SSH Known Hosts",           "SSH known hosts leaked",              [S(200)]),
+    ("/id_rsa",            "critical","RSA Private Key",          "RSA private key exposed",             [W("PRIVATE KEY")]),
+    ("/private.key",       "critical","Private Key File",         "Private key file exposed",            [W("PRIVATE KEY")]),
+    ("/cert.pem",          "medium", "Certificate PEM",           "TLS cert exposed",                    [W("BEGIN CERTIFICATE")]),
+
+    # ---------- CLOUD ----------
+    ("/.aws/credentials",   "critical","AWS Credentials",         "AWS creds file",                      [W("aws_access_key_id")]),
+    ("/.aws/config",        "high",   "AWS Config",               "AWS config file",                     [W("[default]")]),
+    ("/.azure/credentials", "critical","Azure Credentials",       "Azure creds file",                    [S(200)]),
+    ("/gcloud.json",        "critical","GCloud Service JSON",     "GCloud service account",              [W("project_id")]),
+    ("/service-account.json","critical","Service Account JSON",   "Service account JSON",                [W("private_key")]),
+    ("/firebase.json",      "high",   "Firebase Config",          "Firebase config leaked",              [S(200)]),
+    ("/.kube/config",       "critical","Kubernetes Config",       "Kube config leaked",                  [W("clusters:")]),
+    ("/.docker/config.json","high",   "Docker Config",            "Docker auth config leaked",           [R(r"auths|credsStore")]),
+    ("/.dockerenv",         "low",    "Docker Env Marker",        "Container .dockerenv leaked",         [S(200)]),
+
+    # ---------- BACKUPS / DUMPS ----------
+    ("/backup.sql",         "critical","SQL Backup",              "SQL backup file exposed",             [S(200)]),
+    ("/dump.sql",           "critical","SQL Dump",                "SQL dump exposed",                    [S(200)]),
+    ("/database.sql",       "critical","Database SQL",            "Database SQL dump",                   [S(200)]),
+    ("/data.sql",           "critical","Data SQL",                "data.sql exposed",                    [S(200)]),
+    ("/db.sql",             "critical","DB SQL",                  "db.sql exposed",                      [S(200)]),
+    ("/backup.zip",         "high",   "ZIP Backup",               "ZIP backup exposed",                  [S(200)]),
+    ("/backup.tar.gz",      "high",   "TAR.GZ Backup",            "TAR.GZ backup exposed",               [S(200)]),
+    ("/backup.tar",         "high",   "TAR Backup",               "TAR backup exposed",                  [S(200)]),
+    ("/www.zip",            "high",   "WWW ZIP",                  "www.zip exposed",                     [S(200)]),
+    ("/site.zip",           "high",   "Site ZIP",                 "site.zip exposed",                    [S(200)]),
+    ("/www.tar.gz",         "high",   "WWW TAR.GZ",               "www.tar.gz exposed",                  [S(200)]),
+    ("/html.zip",           "high",   "HTML ZIP",                 "html.zip exposed",                    [S(200)]),
+    ("/public_html.zip",    "high",   "Public HTML ZIP",          "public_html.zip exposed",             [S(200)]),
+
+    # ---------- INFO / DEBUG ----------
+    ("/phpinfo.php",        "medium", "PHPInfo",                  "phpinfo() output exposed",            [W("PHP Version")]),
+    ("/info.php",           "medium", "Info PHP",                 "info.php exposed",                    [W("phpinfo()")]),
+    ("/test.php",           "low",    "Test PHP",                 "test.php exposed",                    [S(200)]),
+    ("/server-status",      "medium", "Apache Server Status",     "Apache mod_status exposed",           [W("Apache Server Status")]),
+    ("/server-info",        "medium", "Apache Server Info",       "Apache mod_info exposed",             [W("Apache Server Information")]),
+    ("/nginx_status",       "medium", "Nginx Status",             "Nginx stub_status exposed",           [W("Active connections")]),
+    ("/debug",              "medium", "Debug Endpoint",           "Debug endpoint",                      [S(200)]),
+    ("/_debug",             "medium", "Underscore Debug",         "_debug endpoint",                     [S(200)]),
+    ("/telescope",          "high",   "Laravel Telescope",        "Laravel telescope exposed",           [S(200)]),
+    ("/telescope/requests", "high",   "Laravel Telescope Requests","Telescope requests exposed",          [S(200)]),
+    ("/_profiler",          "high",   "Symfony Profiler",         "Symfony profiler exposed",            [S(200)]),
+    ("/_profiler/phpinfo",  "critical","Symfony Profiler PHPInfo", "Symfony profiler phpinfo",            [W("PHP Version")]),
+    ("/_ignition/health-check","medium","Ignition Health",        "Laravel Ignition health",             [S(200)]),
+
+    # ---------- SPRING ACTUATORS ----------
+    ("/actuator",                  "medium",   "Spring Actuator Root",  "Spring actuator index",           [W("_links")]),
+    ("/actuator/env",              "critical", "Actuator Env",          "Env properties exposed",          [W("propertySources")]),
+    ("/actuator/health",           "low",      "Actuator Health",       "Health endpoint",                 [W("status")]),
+    ("/actuator/beans",            "high",     "Actuator Beans",        "Beans dumped",                    [W("beans")]),
+    ("/actuator/heapdump",         "critical", "Actuator Heapdump",     "Heap dump download",              [S(200)]),
+    ("/actuator/mappings",         "high",     "Actuator Mappings",     "Route mappings leaked",           [W("mappings")]),
+    ("/actuator/configprops",      "high",     "Actuator Configprops",  "Config properties leaked",        [W("contexts")]),
+    ("/actuator/threaddump",       "medium",   "Actuator Threaddump",   "Thread dump leaked",              [W("threadName")]),
+    ("/actuator/jolokia",          "high",     "Actuator Jolokia",      "Jolokia agent exposed",           [W("jolokia")]),
+    ("/actuator/info",             "low",      "Actuator Info",         "App info endpoint",               [S(200)]),
+    ("/actuator/loggers",          "medium",   "Actuator Loggers",      "Loggers exposed",                 [W("loggers")]),
+    ("/actuator/scheduledtasks",   "medium",   "Actuator Scheduled",    "Scheduled tasks leaked",          [W("cron")]),
+
+    # ---------- ADMIN PANELS ----------
+    ("/admin",             "high",   "Admin Panel",               "Admin panel exposed",                 [S(200)]),
+    ("/admin/",            "high",   "Admin Directory",           "Admin directory exposed",             [S(200)]),
+    ("/admin.php",         "high",   "Admin PHP",                 "admin.php exposed",                   [S(200)]),
+    ("/admin/login",       "high",   "Admin Login",               "Admin login page",                    [S(200)]),
+    ("/admin/login.php",   "high",   "Admin Login PHP",           "Admin login PHP",                     [S(200)]),
+    ("/admin/index.php",   "high",   "Admin Index PHP",           "Admin index PHP",                     [S(200)]),
+    ("/administrator",     "high",   "Joomla Admin",              "Joomla administrator exposed",        [W("Joomla")]),
+    ("/administrator/index.php","high","Joomla Admin Index",      "Joomla admin index",                  [S(200)]),
+    ("/wp-admin",          "high",   "WP Admin",                  "WordPress admin exposed",             [S(200, 302)]),
+    ("/wp-login.php",      "medium", "WP Login",                  "WordPress login exposed",             [W("WordPress")]),
+    ("/login",             "low",    "Login Page",                "Generic login page",                  [S(200)]),
+    ("/login.php",         "low",    "Login PHP",                 "login.php exposed",                   [S(200)]),
+    ("/login.html",        "low",    "Login HTML",                "login.html exposed",                  [S(200)]),
+    ("/dashboard",         "medium", "Dashboard",                 "Dashboard exposed",                   [S(200)]),
+    ("/cpanel",            "high",   "cPanel",                    "cPanel login page",                   [W("cPanel")]),
+    ("/manager/html",      "high",   "Tomcat Manager",            "Tomcat manager exposed",              [W("Tomcat")]),
+    ("/host-manager/html", "high",   "Tomcat Host Manager",       "Tomcat host manager",                 [W("Tomcat")]),
+
+    # ---------- DATABASE TOOLS ----------
+    ("/phpmyadmin",        "high",   "phpMyAdmin",                "phpMyAdmin panel",                    [W("phpMyAdmin")]),
+    ("/phpMyAdmin/",       "high",   "phpMyAdmin Slash",          "phpMyAdmin directory",                [W("phpMyAdmin")]),
+    ("/pma",               "high",   "phpMyAdmin PMA",            "phpMyAdmin PMA",                      [W("phpMyAdmin")]),
+    ("/pma/index.php",     "high",   "phpMyAdmin PMA Index",      "phpMyAdmin PMA index",                [W("phpMyAdmin")]),
+    ("/adminer.php",       "high",   "Adminer",                   "Adminer DB tool",                     [W("Adminer")]),
+    ("/adminer",           "high",   "Adminer Path",              "Adminer path",                        [W("Adminer")]),
+    ("/mysql/",            "medium", "MySQL Directory",           "MySQL directory",                     [S(200)]),
+    ("/mysqladmin",        "medium", "MySQL Admin",               "MySQL admin tool",                    [S(200)]),
+    ("/dbadmin",           "medium", "DB Admin",                  "DB admin panel",                      [S(200)]),
+    ("/sqlbuddy",          "medium", "SQL Buddy",                 "SQL Buddy panel",                     [S(200)]),
+    ("/phpminiadmin.php",  "high",   "PHP Mini Admin",            "phpminiadmin exposed",                [S(200)]),
+    ("/setup/",            "medium", "Setup Directory",           "Setup directory",                     [S(200)]),
+
+    # ---------- API / SWAGGER ----------
+    ("/swagger.json",       "medium", "Swagger JSON",             "Swagger spec",                        [W("swagger")]),
+    ("/openapi.json",       "medium", "OpenAPI JSON",             "OpenAPI spec",                        [W("openapi")]),
+    ("/api-docs",           "medium", "API Docs",                 "API docs page",                       [W("swagger")]),
+    ("/api-docs/swagger.json","medium","API Docs Swagger",        "API docs swagger",                    [W("swagger")]),
+    ("/v2/api-docs",        "medium", "Swagger v2",               "Swagger v2 docs",                     [W("swagger")]),
+    ("/v3/api-docs",        "medium", "Swagger v3",               "Swagger v3 docs",                     [W("openapi")]),
+    ("/graphql",            "medium", "GraphQL",                  "GraphQL endpoint",                    [W("GraphQL")]),
+    ("/graphiql",           "medium", "GraphiQL IDE",             "GraphiQL IDE exposed",                [W("GraphiQL")]),
+    ("/api",                "low",    "API Root",                 "API root exposed",                    [S(200)]),
+    ("/api/v1",             "low",    "API v1",                   "API v1 exposed",                      [S(200)]),
+
+    # ---------- FRAMEWORK CONFIGS ----------
+    ("/parameters.yml",     "high",   "Symfony Parameters",       "Symfony parameters leaked",           [W("parameters")]),
+    ("/settings.py",        "high",   "Django Settings",          "Django settings leaked",              [W("SECRET_KEY")]),
+    ("/settings.py.bak",    "critical","Django Settings Backup",   "Django settings backup",              [W("SECRET_KEY")]),
+    ("/application.properties","high","Spring Application Props",  "Spring properties",                   [W("spring")]),
+    ("/application.yml",    "high",   "Spring Application YML",   "Spring yml",                          [W("spring")]),
+    ("/bootstrap.yml",      "high",   "Spring Bootstrap",         "Spring bootstrap yml",                [W("spring")]),
+    ("/appsettings.json",   "high",   ".NET AppSettings",         ".NET settings leaked",                [W("ConnectionStrings")]),
+    ("/config.json",        "medium", "Config JSON",              "config.json exposed",                 [S(200)]),
+    ("/config.yaml",        "medium", "Config YAML",              "config.yaml exposed",                 [S(200)]),
+    ("/secrets.yml",        "critical","Secrets YML",             "Secrets yml leaked",                  [W("secret")]),
+    ("/secrets.json",       "critical","Secrets JSON",            "Secrets json leaked",                 [S(200)]),
+    ("/credentials.json",   "critical","Credentials JSON",        "Credentials json leaked",             [W("type")]),
+
+    # ---------- CI/CD ----------
+    ("/.gitlab-ci.yml",              "medium", "GitLab CI",          "GitLab CI config leaked",           [W("stages:")]),
+    ("/.travis.yml",                 "medium", "Travis CI",          "Travis CI config leaked",           [W("language:")]),
+    ("/Jenkinsfile",                 "medium", "Jenkinsfile",        "Jenkins pipeline leaked",           [W("pipeline")]),
+    ("/.circleci/config.yml",        "medium", "CircleCI Config",    "CircleCI config leaked",            [W("version:")]),
+    ("/.github/workflows/main.yml",  "medium", "GitHub Actions",     "GitHub workflow leaked",            [W("on:")]),
+    ("/bitbucket-pipelines.yml",     "medium", "Bitbucket Pipeline", "Bitbucket pipeline leaked",         [W("pipelines:")]),
+    ("/azure-pipelines.yml",         "medium", "Azure Pipelines",    "Azure pipelines leaked",            [W("trigger:")]),
+    ("/.drone.yml",                  "medium", "Drone CI",           "Drone CI config leaked",            [W("kind:")]),
+
+    # ---------- IDE ----------
+    ("/.idea/workspace.xml",         "low", "IntelliJ Workspace",   "IDE workspace leaked",              [S(200)]),
+    ("/.vscode/settings.json",       "low", "VSCode Settings",      "VSCode settings leaked",            [S(200)]),
+    ("/.project",                    "low", "Eclipse Project",      "Eclipse .project leaked",           [S(200)]),
+    ("/.classpath",                  "low", "Eclipse Classpath",    "Eclipse classpath leaked",          [S(200)]),
+    ("/.settings/org.eclipse.core.resources.prefs","low","Eclipse Prefs","Eclipse prefs leaked",        [S(200)]),
+    ("/.DS_Store",                   "low", "DS_Store",             "macOS DS_Store leaked",             [S(200)]),
+
+    # ---------- LOGS ----------
+    ("/error.log",                 "high",   "Error Log",         "error.log exposed",                   [R(r"\[.*\] \[.*\]")]),
+    ("/access.log",                "high",   "Access Log",        "access.log exposed",                  [R(r"GET|POST")]),
+    ("/debug.log",                 "medium", "Debug Log",         "debug.log exposed",                   [S(200)]),
+    ("/storage/logs/laravel.log",  "high",   "Laravel Log",       "Laravel log leaked",                  [W("local.ERROR")]),
+    ("/wp-content/debug.log",      "medium", "WP Debug Log",      "WordPress debug log",                 [S(200)]),
+    ("/var/log/apache2/access.log","medium", "Apache Access Log", "Apache access log path",              [S(200)]),
+
+    # ---------- SOURCE MAPS / NODE ----------
+    ("/js/app.js.map",             "low",    "Source Map app",    "JS source map exposed",               [W("version")]),
+    ("/static/js/main.js.map",     "low",    "Source Map main",   "JS main source map",                  [W("version")]),
+    ("/app.js.map",                "low",    "Source Map root",   "Root source map",                     [W("version")]),
+    ("/package-lock.json",         "low",    "Package Lock",      "package-lock.json exposed",           [W("lockfileVersion")]),
+    ("/node_modules/",             "low",    "Node Modules",      "node_modules directory listing",      [W("Index of")]),
+
+    # ---------- WORDPRESS ----------
+    ("/wp-config.php",             "high",   "WP Config",         "wp-config.php exposed",               [W("DB_NAME")]),
+    ("/wp-config-sample.php",      "low",    "WP Config Sample",  "WP config sample",                    [W("DB_NAME")]),
+    ("/xmlrpc.php",                "medium", "WP XML-RPC",        "XML-RPC endpoint",                    [W("XML-RPC")]),
+    ("/wp-json/wp/v2/users",       "medium", "WP Users API",      "WordPress users leaked",              [W("id")]),
+    ("/wp-cron.php",               "low",    "WP Cron",           "WP cron endpoint",                    [S(200)]),
+    ("/wp-admin/setup-config.php", "medium", "WP Setup",          "WP setup exposed",                    [S(200)]),
+
+    # ---------- JOOMLA ----------
+    ("/configuration.php",         "high",   "Joomla Config",     "Joomla config",                       [W("class JConfig")]),
+    ("/administrator/manifests/files/joomla.xml","low","Joomla XML","Joomla version manifest",           [W("<version>")]),
+    ("/language/en-GB/en-GB.xml",  "low",    "Joomla Lang XML",   "Joomla language XML",                 [S(200)]),
+
+    # ---------- DRUPAL ----------
+    ("/sites/default/settings.php","high",   "Drupal Settings",   "Drupal settings",                     [S(200)]),
+    ("/CHANGELOG.txt",             "low",    "Drupal Changelog",  "Drupal changelog",                    [W("Drupal")]),
+    ("/core/CHANGELOG.txt",        "low",    "Drupal Core Log",   "Drupal core changelog",               [W("Drupal")]),
+
+    # ---------- LARAVEL / DJANGO ----------
+    ("/vendor/",                   "low",    "Vendor Directory",  "vendor directory listing",            [W("Index of")]),
+    ("/manage.py",                 "medium", "Django Manage",     "manage.py leaked",                    [W("django")]),
+
+    # ---------- MISC INFO FILES ----------
+    ("/robots.txt",                "info",   "Robots.txt",        "Robots.txt disclosed",                [S(200)]),
+    ("/sitemap.xml",               "info",   "Sitemap XML",       "sitemap.xml disclosed",               [S(200)]),
+    ("/crossdomain.xml",           "low",    "Crossdomain XML",   "crossdomain.xml present",             [S(200)]),
+    ("/package.json",              "medium", "NPM Package JSON",  "package.json exposed",                [W("dependencies")]),
+    ("/composer.json",             "medium", "Composer JSON",     "composer.json exposed",               [W("require")]),
+    ("/yarn.lock",                 "low",    "Yarn Lock",         "yarn.lock exposed",                   [S(200)]),
+    ("/Gemfile.lock",              "low",    "Gemfile Lock",      "Gemfile.lock exposed",                [S(200)]),
+    ("/Gemfile",                   "low",    "Gemfile",           "Gemfile exposed",                     [W("source")]),
+    ("/requirements.txt",          "low",    "Requirements TXT",  "requirements.txt exposed",            [S(200)]),
+    ("/Pipfile",                   "low",    "Pipfile",           "Pipfile exposed",                     [W("[[source]]")]),
+
+    # ---------- GO / JAVA ----------
+    ("/go.mod",                    "low",    "Go Module",         "go.mod exposed",                      [W("module")]),
+    ("/go.sum",                    "low",    "Go Sum",            "go.sum exposed",                      [S(200)]),
+    ("/META-INF/MANIFEST.MF",      "low",    "JAR Manifest",      "JAR manifest leaked",                 [W("Manifest-Version")]),
+    ("/WEB-INF/web.xml",           "medium", "WEB-INF web.xml",   "Java web.xml leaked",                 [W("web-app")]),
+
+    # ---------- DIRECTORY LISTING ----------
+    ("/uploads/",                  "low",    "Uploads Directory", "Uploads directory listing",           [W("Index of")]),
+    ("/backup/",                   "high",   "Backup Directory",  "Backup directory listing",            [W("Index of")]),
+    ("/logs/",                     "medium", "Logs Directory",    "Logs directory listing",              [W("Index of")]),
+    ("/files/",                    "low",    "Files Directory",   "Files directory listing",             [W("Index of")]),
+    ("/images/",                   "info",   "Images Directory",  "Images listing",                      [W("Index of")]),
+    ("/static/",                   "info",   "Static Directory",  "Static directory",                    [W("Index of")]),
+    ("/assets/",                   "info",   "Assets Directory",  "Assets directory",                    [W("Index of")]),
+    ("/tmp/",                      "medium", "TMP Directory",     "tmp directory listing",               [W("Index of")]),
+    ("/temp/",                     "medium", "Temp Directory",    "temp directory listing",              [W("Index of")]),
+    ("/data/",                     "medium", "Data Directory",    "data directory listing",              [W("Index of")]),
+
+    # ---------- STATUS / HEALTH ----------
+    ("/status",                    "info",   "Status Endpoint",   "status endpoint",                     [S(200)]),
+    ("/health",                    "info",   "Health Endpoint",   "health endpoint",                     [S(200)]),
+    ("/healthz",                   "info",   "Healthz",           "k8s healthz endpoint",                [S(200)]),
+    ("/readyz",                    "info",   "Readyz",            "k8s readyz endpoint",                 [S(200)]),
+    ("/livez",                     "info",   "Livez",             "k8s livez endpoint",                  [S(200)]),
+    ("/ping",                      "info",   "Ping",              "ping endpoint",                       [S(200)]),
+    ("/version",                   "low",    "Version Endpoint",  "version endpoint",                    [S(200)]),
+    ("/metrics",                   "medium", "Prometheus Metrics","Prometheus metrics leaked",           [W("# HELP")]),
+
+    # ---------- BACKDOOR-STYLE PATTERNS ----------
+    ("/shell.php",                 "high",   "Shell PHP",         "shell.php exposed",                   [S(200)]),
+    ("/cmd.php",                   "high",   "Cmd PHP",           "cmd.php exposed",                     [S(200)]),
+    ("/exec.php",                  "high",   "Exec PHP",          "exec.php exposed",                    [S(200)]),
+    ("/upload.php",                "medium", "Upload PHP",        "upload.php exposed",                  [S(200)]),
+
+    # ---------- DOCKER / DEVOPS ----------
+    ("/Dockerfile",                "low",    "Dockerfile",        "Dockerfile leaked",                   [W("FROM")]),
+    ("/docker-compose.yml",        "low",    "Docker Compose",    "docker-compose leaked",               [W("services:")]),
+    ("/docker-compose.yaml",       "low",    "Docker Compose YAML","docker-compose yaml leaked",         [W("services:")]),
+    ("/Vagrantfile",               "low",    "Vagrantfile",       "Vagrantfile leaked",                  [W("Vagrant")]),
+    ("/Procfile",                  "low",    "Procfile",          "Heroku Procfile leaked",              [W("web:")]),
+    ("/Chart.yaml",                "low",    "Helm Chart",        "Helm Chart leaked",                   [W("apiVersion")]),
+    ("/kustomization.yaml",        "low",    "Kustomization",     "Kustomization leaked",                [W("resources:")]),
+
+    # ---------- CTF ----------
+    ("/flag.txt",                  "medium", "Flag TXT",          "flag.txt exposed",                    [S(200)]),
+    ("/flag",                      "medium", "Flag",              "flag file exposed",                   [S(200)]),
+    ("/flag.php",                  "medium", "Flag PHP",          "flag.php exposed",                    [S(200)]),
+    ("/.flag",                     "medium", "Dot Flag",          ".flag exposed",                       [S(200)]),
+    ("/FLAG",                      "medium", "FLAG uppercase",    "FLAG file exposed",                   [S(200)]),
+
+    # ---------- LFI / PATH TRAVERSAL ----------
+    ("/../../../../etc/passwd",   "critical","Path Traversal passwd","LFI to /etc/passwd",                 [W("root:x:0:0")]),
+    ("/etc/passwd",               "critical","etc/passwd Exposure", "etc/passwd exposed directly",       [W("root:x:0:0")]),
+    ("/proc/self/environ",        "high",   "proc environ",         "proc environ leaked",                [W("PATH=")]),
+
+    # ---------- LICENSE / README ----------
+    ("/LICENSE",                   "info",   "License",           "LICENSE disclosed",                   [S(200)]),
+    ("/README.md",                 "info",   "README",            "README disclosed",                    [S(200)]),
+    ("/CHANGELOG.md",              "info",   "Changelog",         "changelog leaked",                    [S(200)]),
+]
+
+
+# ============================================================
+# TEMPLATE GENERATOR
+# ============================================================
+def _make_id(path, idx):
+    slug = re.sub(r'[^a-z0-9]+', '-', path.strip('/').lower()).strip('-')
+    return f"nz-{idx+1:03d}-{slug[:40]}"
+
+
+def generate_templates_from_checks():
+    templates = []
+    for idx, entry in enumerate(SENSITIVE_CHECKS):
+        if len(entry) == 5:
+            path, severity, name, desc, matchers = entry
+            condition = "or"
+        else:
+            path, severity, name, desc, matchers, condition = entry
+        tid = _make_id(path, idx)
+        tags = "exposure,misconfig,nuclei-clone"
+        if severity in ("critical", "high"):
+            tags += ",intrusive"
+        templates.append({
+            "id": tid,
+            "info": {
+                "name": name,
+                "author": "nazreal",
+                "severity": severity,
+                "description": desc,
+                "tags": tags,
+            },
+            "http": [{
+                "method": "GET",
+                "path": ["{{BaseURL}}" + path],
+                "redirects": False,
+                "max-redirects": 2,
+                "matchers-condition": condition,
+                "matchers": matchers,
+            }],
+        })
+    return templates
+
+
+# ============================================================
+# NUCLEI LITE ENGINE
+# ============================================================
+class NucleiLite:
+    def __init__(self, target=None, targets=None, templates_dir=None,
+                 severity_filter=None, tag_filter=None, concurrency=20,
+                 rate_limit=50, timeout=10, retries=1, headers=None,
+                 proxy=None, verbose=False, silent=False, no_color=False,
+                 output_jsonl=None, output_md=None, output_html=None,
+                 show_stats=False):
+        self.targets = []
+        if targets:
+            self.targets.extend(targets)
+        if target:
+            self.targets.append(target)
+        self.targets = [self._normalize(t) for t in self.targets if t]
+
+        self.templates = []
+        self.templates_dir = templates_dir
+        self.severity_filter = set(s.lower() for s in severity_filter) if severity_filter else None
+        self.tag_filter = set(t.lower() for t in tag_filter) if tag_filter else None
+        self.concurrency = max(1, concurrency)
+        self.rate_limit = max(1, rate_limit)
+        self.timeout = timeout
+        self.retries = max(0, retries)
+        self.custom_headers = headers or {}
+        self.proxy = proxy
+        self.verbose = verbose
+        self.silent = silent
+        self.no_color = no_color
+        self.output_jsonl = output_jsonl
+        self.output_md = output_md
+        self.output_html = output_html
+        self.show_stats = show_stats
+
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Linux; Android 13; Termux) NucleiClone/1.10",
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+        })
+        self.session.headers.update(self.custom_headers)
+        if proxy:
+            self.session.proxies.update({"http": proxy, "https": proxy})
+
+        self.lock = threading.Lock()
+        self.results = []
+        self._last_request_time = 0.0
+        self._rate_lock = threading.Lock()
+        self._request_count = 0
+        self._start_time = None
+
+    # ---------- helpers ----------
+    @staticmethod
+    def _normalize(url):
+        url = url.strip()
+        if not url:
+            return ""
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+        return url.rstrip("/")
+
+    def _c(self, color, text):
+        if self.no_color:
+            return text
+        return f"{color}{text}{Style.RESET_ALL}"
+
+    def _log(self, msg, color=None):
+        if self.silent:
+            return
+        with self.lock:
+            if color:
+                print(self._c(color, msg))
+            else:
+                print(msg)
+
+    # ---------- template loading ----------
+    def load_templates(self):
+        loaded = []
+        if self.templates_dir and os.path.isdir(self.templates_dir):
+            for root, _, files in os.walk(self.templates_dir):
+                for f in files:
+                    if f.endswith((".yaml", ".yml")):
+                        p = os.path.join(root, f)
+                        try:
+                            with open(p, "r", encoding="utf-8", errors="ignore") as fh:
+                                for doc in yaml.safe_load_all(fh):
+                                    if self._valid_template(doc):
+                                        loaded.append(doc)
+                        except Exception:
+                            continue
+        if not loaded:
+            loaded = generate_templates_from_checks()
+
+        if self.severity_filter:
+            loaded = [t for t in loaded
+                      if str(t.get("info", {}).get("severity", "")).lower() in self.severity_filter]
+
+        if self.tag_filter:
+            filtered = []
+            for t in loaded:
+                tags = t.get("info", {}).get("tags", "")
+                if isinstance(tags, str):
+                    tags = [x.strip().lower() for x in tags.split(",") if x.strip()]
+                else:
+                    tags = [str(x).lower() for x in tags]
+                if any(tg in tags for tg in self.tag_filter):
+                    filtered.append(t)
+            loaded = filtered
+
+        loaded.sort(key=lambda t: -SEV_ORDER.get(
+            str(t.get("info", {}).get("severity", "unknown")).lower(), 0))
+        self.templates = loaded
+        return loaded
+
+    @staticmethod
+    def _valid_template(t):
+        return (isinstance(t, dict) and "id" in t and "info" in t
+                and ("http" in t or "requests" in t))
+
+    # ---------- rate limit ----------
+    def _wait_rate(self):
+        with self._rate_lock:
+            now = time.time()
+            interval = 1.0 / self.rate_limit
+            wait = interval - (now - self._last_request_time)
+            if wait > 0:
+                time.sleep(wait)
+            self._last_request_time = time.time()
+            self._request_count += 1
+
+    # ---------- matchers ----------
+    def _get_part(self, response, part):
+        if part == "header":
+            return "\n".join(f"{k}: {v}" for k, v in response.headers.items())
+        if part == "all":
+            return response.text + "\n" + "\n".join(f"{k}: {v}" for k, v in response.headers.items())
+        return response.text or ""
+
+    def _eval_dsl(self, expr, response):
+        try:
+            for bad in ["__", "import", "exec", "eval", "open(", "os.", "sys.", "subprocess"]:
+                if bad in expr:
+                    return False
+            env = {
+                "status_code": response.status_code,
+                "body": response.text or "",
+                "content_length": len(response.content),
+                "header": dict(response.headers),
+                "true": True, "false": False, "null": None,
+                "contains": lambda s, sub: sub in (s or ""),
+                "icontains": lambda s, sub: sub.lower() in (s or "").lower(),
+                "regex": lambda pat, s: bool(re.search(pat, s or "")),
+                "md5": lambda s: hashlib.md5((s or "").encode()).hexdigest(),
+                "sha256": lambda s: hashlib.sha256((s or "").encode()).hexdigest(),
+            }
+            return bool(eval(expr, {"__builtins__": {}}, env))
+        except Exception:
+            return False
+
+    def _match(self, matchers, block_cond, response):
+        if not matchers:
+            return True
+        results = []
+        for m in matchers:
+            mtype = str(m.get("type", "")).lower()
+            part = str(m.get("part", "body")).lower()
+            negative = bool(m.get("negative", False))
+            matcher_cond = str(m.get("condition", "or")).lower()
+
+            if mtype == "status":
+                st = m.get("status", [])
+                if isinstance(st, int):
+                    st = [st]
+                ok = response.status_code in st
+
+            elif mtype == "word":
+                words = m.get("words", [])
+                if isinstance(words, str):
+                    words = [words]
+                ci = m.get("case-insensitive", True)
+                text = self._get_part(response, part)
+                if ci:
+                    text = text.lower()
+                    words = [str(w).lower() for w in words]
+                ok = all(w in text for w in words) if matcher_cond == "and" else any(w in text for w in words)
+
+            elif mtype == "regex":
+                pats = m.get("regex", [])
+                if isinstance(pats, str):
+                    pats = [pats]
+                text = self._get_part(response, part)
+                if matcher_cond == "and":
+                    ok = all(bool(re.search(p, text)) for p in pats)
+                else:
+                    ok = any(bool(re.search(p, text)) for p in pats)
+
+            elif mtype == "size":
+                sizes = m.get("size", [])
+                if isinstance(sizes, int):
+                    sizes = [sizes]
+                ok = len(response.content) in sizes
+
+            elif mtype == "dsl":
+                exprs = m.get("dsl", [])
+                if isinstance(exprs, str):
+                    exprs = [exprs]
+                ok = any(self._eval_dsl(e, response) for e in exprs)
+
+            elif mtype == "binary":
+                ok = False  # not implemented (needs raw socket)
+            else:
+                ok = False
+
+            if negative:
+                ok = not ok
+            results.append(ok)
+
+        return all(results) if block_cond == "and" else any(results)
+
+    # ---------- extractors ----------
+    def _extract(self, extractors, response):
+        out = []
+        for ext in extractors or []:
+            etype = str(ext.get("type", "")).lower()
+            part = str(ext.get("part", "body")).lower()
+            text = self._get_part(response, part)
+            if etype == "regex":
+                pats = ext.get("regex", [])
+                if isinstance(pats, str):
+                    pats = [pats]
+                for p in pats:
+                    try:
+                        for m in re.finditer(p, text):
+                            out.append({"type": "regex", "pattern": p, "value": m.group(0)[:120]})
+                    except re.error:
+                        continue
+            elif etype == "kval":
+                keys = ext.get("kval", [])
+                if isinstance(keys, str):
+                    keys = [keys]
+                for k, v in response.headers.items():
+                    if k.lower() in [x.lower() for x in keys]:
+                        out.append({"type": "kval", "name": k, "value": v})
+        return out
+
+    # ---------- substitution ----------
+    def _substitute(self, text, target):
+        if not isinstance(text, str):
+            return str(text)
+        host = urlparse(target).netloc
+        rand = "".join(random.choices(string.ascii_lowercase + string.digits, k=10))
+        return (text.replace("{{BaseURL}}", target)
+                    .replace("{{Hostname}}", urlparse(target).hostname or "")
+                    .replace("{{Host}}", host)
+                    .replace("{{RootURL}}", target)
+                    .replace("{{RandomString}}", rand))
+
+    # ---------- execute one template ----------
+    def _execute(self, template, target):
+        tid = template.get("id", "unknown")
+        info = template.get("info", {})
+        http_blocks = template.get("http") or template.get("requests") or []
+
+        for block in http_blocks:
+            method = str(block.get("method", "GET")).upper()
+            paths = block.get("path", [])
+            if isinstance(paths, str):
+                paths = [paths]
+            block_headers = block.get("headers", {})
+            body = block.get("body")
+            matchers = block.get("matchers", [])
+            cond = str(block.get("matchers-condition", "or")).lower()
+            extractors = block.get("extractors", [])
+            follow = bool(block.get("redirects", False))
+
+            for path_tpl in paths:
+                path = self._substitute(path_tpl, target)
+                url = urljoin(target + "/", path.lstrip("/"))
+
+                resp = None
+                for attempt in range(self.retries + 1):
+                    self._wait_rate()
+                    try:
+                        resp = self.session.request(
+                            method=method, url=url, headers=block_headers,
+                            data=body, timeout=self.timeout,
+                            verify=False, allow_redirects=follow,
+                        )
+                        break
+                    except Exception as e:
+                        if attempt >= self.retries:
+                            if self.verbose:
+                                self._log(f"[ERR] {tid} -> {url} : {e}", Fore.RED)
+                            resp = None
+
+                if resp is None:
+                    continue
+
+                if self._match(matchers, cond, resp):
+                    extracted = self._extract(extractors, resp)
+                    self._report(template, target, url, resp, extracted)
+                    break
+
+    # ---------- reporting ----------
+    def _report(self, template, target, url, response, extracted=None):
+        info = template.get("info", {})
+        severity = str(info.get("severity", "unknown")).lower()
+        tid = template.get("id", "unknown")
+        name = info.get("name", tid)
+        color = SEV_COLOR.get(severity, Fore.WHITE)
+        badge = SEV_BADGE.get(severity, "[ UNKNOWN  ]")
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        line = (f"{self._c(color, badge)} "
+                f"[{self._c(Fore.CYAN, tid)}] "
+                f"[{url}] "
+                f"[{self._c(Fore.GREEN, name)}]")
+
+        with self.lock:
+            self.results.append({
+                "timestamp": ts,
+                "target": target,
+                "severity": severity,
+                "template_id": tid,
+                "name": name,
+                "url": url,
+                "status_code": response.status_code,
+                "content_length": len(response.content),
+                "extracted": extracted or [],
+            })
+            if not self.silent:
+                print(line)
+            if self.output_jsonl:
+                try:
+                    with open(self.output_jsonl, "a", encoding="utf-8") as fh:
+                        fh.write(json.dumps(self.results[-1]) + "\n")
+                except Exception:
+                    pass
+
+    # ---------- run ----------
+    def _print_header(self):
+        if self.silent:
+            return
+        print(self._c(Fore.CYAN, BANNER))
+        print(self._c(Fore.YELLOW, f"  Version  : 1.10 (Deep & Complete)"))
+        print(self._c(Fore.YELLOW, f"  Targets  : {len(self.targets)}"))
+        print(self._c(Fore.YELLOW, f"  Templates: {len(self.templates)}"))
+        print(self._c(Fore.YELLOW, f"  Threads  : {self.concurrency}  |  Rate: {self.rate_limit}/s  |  Timeout: {self.timeout}s"))
+        if self.severity_filter:
+            print(self._c(Fore.YELLOW, f"  Severity : {', '.join(sorted(self.severity_filter))}"))
+        print(self._c(Fore.WHITE, "-" * 78))
+
+    def _print_stats(self, elapsed):
+        if self.silent:
+            return
+        counts = {}
+        for r in self.results:
+            counts[r["severity"]] = counts.get(r["severity"], 0) + 1
+        print(self._c(Fore.WHITE, "-" * 78))
+        print(self._c(Fore.CYAN, "=== SCAN STATISTICS ==="))
+        print(f"  Targets        : {len(self.targets)}")
+        print(f"  Templates      : {len(self.templates)}")
+        print(f"  Requests sent  : {self._request_count}")
+        print(f"  Total findings : {len(self.results)}")
+        for sev in ["critical", "high", "medium", "low", "info", "unknown"]:
+            if sev in counts:
+                print(f"    {self._c(SEV_COLOR[sev], SEV_BADGE[sev])} : {counts[sev]}")
+        print(f"  Duration       : {elapsed:.2f}s")
+
+    def _write_markdown(self, elapsed):
+        if not self.output_md:
+            return
+        try:
+            with open(self.output_md, "w", encoding="utf-8") as fh:
+                fh.write(f"# Nuclei Clone Report\n\n")
+                fh.write(f"- Generated: `{datetime.now().isoformat()}`\n")
+                fh.write(f"- Targets: `{', '.join(self.targets)}`\n")
+                fh.write(f"- Templates run: `{len(self.templates)}`\n")
+                fh.write(f"- Duration: `{elapsed:.2f}s`\n")
+                fh.write(f"- Findings: `{len(self.results)}`\n\n")
+                if not self.results:
+                    fh.write("_No findings._\n")
+                    return
+                fh.write("| Severity | Template | Name | URL | Status |\n")
+                fh.write("|----------|----------|------|-----|--------|\n")
+                for r in sorted(self.results, key=lambda x: -SEV_ORDER.get(x["severity"], 0)):
+                    fh.write(f"| **{r['severity'].upper()}** | `{r['template_id']}` | {r['name']} | {r['url']} | {r['status_code']} |\n")
+        except Exception as e:
+            print(f"[!] Markdown write error: {e}", file=sys.stderr)
+
+    def _write_html(self, elapsed):
+        if not self.output_html:
+            return
+        rows = ""
+        for r in sorted(self.results, key=lambda x: -SEV_ORDER.get(x["severity"], 0)):
+            color = {"critical": "#c0392b", "high": "#e74c3c", "medium": "#f39c12",
+                     "low": "#3498db", "info": "#16a085", "unknown": "#7f8c8d"}.get(r["severity"], "#7f8c8d")
+            rows += (f"<tr><td><span class='badge' style='background:{color}'>{r['severity'].upper()}</span></td>"
+                     f"<td><code>{r['template_id']}</code></td>"
+                     f"<td>{r['name']}</td>"
+                     f"<td><a href='{r['url']}' target='_blank'>{r['url']}</a></td>"
+                     f"<td>{r['status_code']}</td></tr>\n")
+        if not rows:
+            rows = "<tr><td colspan='5'><em>No findings.</em></td></tr>"
+        html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Nuclei Clone Report</title>
+<style>
+body{{font-family:-apple-system,Segoe UI,Roboto,sans-serif;margin:24px;background:#f5f6fa;color:#2c3e50}}
+h1{{margin:0}} .meta{{color:#7f8c8d;margin-bottom:16px}}
+table{{width:100%;border-collapse:collapse;background:#fff;box-shadow:0 2px 6px rgba(0,0,0,.1)}}
+th,td{{padding:8px 12px;border-bottom:1px solid #ecf0f1;text-align:left;font-size:14px}}
+th{{background:#34495e;color:#fff}} .badge{{padding:2px 8px;border-radius:4px;color:#fff;font-size:11px;font-weight:bold}}
+a{{color:#2980b9;text-decoration:none}} code{{font-family:monospace;background:#ecf0f1;padding:2px 4px;border-radius:3px}}
+</style></head><body>
+<h1>Nuclei Clone — Scan Report</h1>
+<div class="meta">Generated: {datetime.now().isoformat()} · Duration: {elapsed:.2f}s · Findings: {len(self.results)}</div>
+<table><thead><tr><th>Severity</th><th>Template</th><th>Name</th><th>URL</th><th>Status</th></tr></thead>
+<tbody>{rows}</tbody></table></body></html>"""
+        try:
+            with open(self.output_html, "w", encoding="utf-8") as fh:
+                fh.write(html)
+        except Exception as e:
+            print(f"[!] HTML write error: {e}", file=sys.stderr)
+
+    def run(self):
+        if not self.templates:
+            self._log("[!] Tidak ada template yang dimuat.", Fore.RED)
+            return
+        if not self.targets:
+            self._log("[!] Tidak ada target.", Fore.RED)
+            return
+
+        self._start_time = time.time()
+        self._print_header()
+
+        def worker(tpl, tgt):
+            try:
+                self._execute(tpl, tgt)
+            except Exception as e:
+                if self.verbose:
+                    self._log(f"[!] {tpl.get('id')} on {tgt} crashed: {e}", Fore.RED)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.concurrency) as ex:
+            futures = [ex.submit(worker, t, tgt)
+                       for tgt in self.targets for t in self.templates]
+            for f in concurrent.futures.as_completed(futures):
+                try:
+                    f.result()
+                except Exception:
+                    pass
+
+        elapsed = time.time() - self._start_time
+
+        if self.show_stats:
+            self._print_stats(elapsed)
+        else:
+            self._log(f"\n[+] Selesai dalam {elapsed:.2f}s. {len(self.results)} temuan.", Fore.GREEN)
+
+        self._write_markdown(elapsed)
+        self._write_html(elapsed)
+
+        if self.output_jsonl:
+            self._log(f"[+] JSONL disimpan ke: {self.output_jsonl}", Fore.CYAN)
+        if self.output_md:
+            self._log(f"[+] Markdown disimpan ke: {self.output_md}", Fore.CYAN)
+        if self.output_html:
+            self._log(f"[+] HTML disimpan ke: {self.output_html}", Fore.CYAN)
+
+
+# ============================================================
+# CLI
+# ============================================================
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="Nuclei Clone for Termux/Android - Deep & Complete Edition",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""Contoh:
+  python nuclei.py -u example.com
+  python nuclei.py -u https://target.com -severity critical,high -stats
+  python nuclei.py -l targets.txt -c 30 -rl 100 -o out.jsonl -md r.md -html r.html
+  python nuclei.py -tl
+""")
+    p.add_argument("-u", "--url", help="Target URL tunggal")
+    p.add_argument("-l", "--list", dest="target_list", help="File daftar target (1 per baris)")
+    p.add_argument("-t", "--templates", help="Direktori template YAML (opsional)")
+    p.add_argument("-s", "--severity", help="Filter severity, contoh: critical,high")
+    p.add_argument("--tags", help="Filter tag, contoh: exposure,misconfig")
+    p.add_argument("-c", "--concurrency", type=int, default=20, help="Thread (default 20)")
+    p.add_argument("-rl", "--rate-limit", type=int, default=50, help="Rate limit req/detik (default 50)")
+    p.add_argument("-timeout", "--timeout", type=int, default=10, help="Timeout detik (default 10)")
+    p.add_argument("-r", "--retry", type=int, default=1, help="Retry per request (default 1)")
+    p.add_argument("-H", "--header", action="append", default=[], help="Custom header, contoh: -H 'Cookie: x=y' (bisa multiple)")
+    p.add_argument("-p", "--proxy", help="Proxy URL, contoh: http://127.0.0.1:8080")
+    p.add_argument("-o", "--output", help="Simpan hasil ke JSONL")
+    p.add_argument("-md", "--markdown", help="Simpan laporan Markdown")
+    p.add_argument("-html", "--html", help="Simpan laporan HTML")
+    p.add_argument("-v", "--verbose", action="store_true", help="Verbose error")
+    p.add_argument("--silent", action="store_true", help="Mode senyap (hanya laporan file)")
+    p.add_argument("--no-color", action="store_true", help="Nonaktifkan warna")
+    p.add_argument("--stats", action="store_true", help="Tampilkan statistik di akhir")
+    p.add_argument("-tl", "--list-templates", action="store_true", help="Tampilkan semua template yang tersedia")
+    p.add_argument("--version", action="store_true", help="Tampilkan versi")
+    return p.parse_args()
+
+
+def parse_headers(raw_list):
+    headers = {}
+    for item in raw_list:
+        if ":" in item:
+            k, v = item.split(":", 1)
+            headers[k.strip()] = v.strip()
+    return headers
+
+
+def load_target_file(path):
+    targets = []
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    targets.append(line)
+    except Exception as e:
+        print(f"[!] Gagal baca target file: {e}", file=sys.stderr)
+    return targets
+
+
+def list_templates_and_exit():
+    templates = generate_templates_from_checks()
+    print(f"{Fore.CYAN}[+] Total template internal: {len(templates)}{Style.RESET_ALL}")
+    print(f"{'SEVERITY':<10} {'ID':<45} NAME")
+    print("-" * 100)
+    for t in templates:
+        sev = t["info"]["severity"].lower()
+        color = SEV_COLOR.get(sev, Fore.WHITE)
+        print(f"{color}{sev.upper():<10}{Style.RESET_ALL} {t['id']:<45} {t['info']['name']}")
+    sys.exit(0)
+
+
+def main():
+    args = parse_args()
+
+    if args.version:
+        print("Nuclei Clone v1.10 — Deep & Complete Edition")
+        sys.exit(0)
+
+    if args.list_templates:
+        if args.no_color:
+            Fore.CYAN = Fore.WHITE = Style.RESET_ALL = ""
+        list_templates_and_exit()
+
+    targets = []
+    if args.target_list:
+        targets.extend(load_target_file(args.target_list))
+    if args.url:
+        targets.append(args.url)
+
+    if not targets:
+        print(f"{Fore.RED}[!] Butuh -u <URL> atau -l <file>{Style.RESET_ALL}")
+        sys.exit(1)
+
+    sev_filter = None
+    if args.severity:
+        sev_filter = [s.strip().lower() for s in args.severity.split(",") if s.strip()]
+
+    tag_filter = None
+    if args.tags:
+        tag_filter = [t.strip().lower() for t in args.tags.split(",") if t.strip()]
+
+    headers = parse_headers(args.header)
+
+    scanner = NucleiLite(
+        targets=targets,
+        templates_dir=args.templates,
+        severity_filter=sev_filter,
+        tag_filter=tag_filter,
+        concurrency=args.concurrency,
+        rate_limit=args.rate_limit,
+        timeout=args.timeout,
+        retries=args.retry,
+        headers=headers,
+        proxy=args.proxy,
+        verbose=args.verbose,
+        silent=args.silent,
+        no_color=args.no_color,
+        output_jsonl=args.output,
+        output_md=args.markdown,
+        output_html=args.html,
+        show_stats=args.stats,
+    )
+    scanner.load_templates()
+    scanner.run()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(f"\n{Fore.YELLOW}[!] Dihentikan oleh pengguna.{Style.RESET_ALL}")
+        sys.exit(0)
